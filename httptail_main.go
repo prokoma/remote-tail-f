@@ -9,11 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
-	"strings"
 	"time"
-
-	"github.com/rclone/rclone/lib/atexit"
 )
 
 var (
@@ -23,28 +19,21 @@ var (
 )
 
 type Tailer struct {
-	url               string
-	lastOffset        int64
-	lastLines         int
-	totalLength       int64
-	requestTimeoutSec int
-	client            *http.Client
+	url                      string
+	stateFilePath            string
+	requestTimeoutSec        int
+	lastOffset               int64
+	unsupportedRangeRequests bool
+	client                   *http.Client
 }
 
-func NewTailer(url string, requestTimeoutSec int) *Tailer {
+func NewTailer(url string, requestTimeoutSec int, stateFilePath string) *Tailer {
 	return &Tailer{
 		url:               url,
 		requestTimeoutSec: requestTimeoutSec,
+		stateFilePath:     stateFilePath,
 		client:            &http.Client{},
 	}
-}
-
-func getTotalLengthFromContentRange(contentRange string) (int64, error) {
-	parts := strings.Split(contentRange, "/")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid Content-Range header: %s", contentRange)
-	}
-	return strconv.ParseInt(parts[1], 10, 64)
 }
 
 func (t *Tailer) fetchNewLines() ([]string, error) {
@@ -57,7 +46,7 @@ func (t *Tailer) fetchNewLines() ([]string, error) {
 	}
 
 	if t.lastOffset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", t.lastOffset - 1))
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", t.lastOffset-1))
 	}
 
 	resp, err := t.client.Do(req)
@@ -69,8 +58,6 @@ func (t *Tailer) fetchNewLines() ([]string, error) {
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
 		fmt.Fprintf(os.Stderr, "Server returned 206, file was probably truncated. Resetting state.\n")
 		t.lastOffset = 0
-		t.lastLines = 0
-		t.totalLength = 0
 		return nil, nil
 	}
 
@@ -83,33 +70,15 @@ func (t *Tailer) fetchNewLines() ([]string, error) {
 		if resp.StatusCode == http.StatusPartialContent {
 			skipBytes = 1
 		} else {
-			fmt.Fprintf(os.Stderr, "Server doesn't support range requests.\n")
+			if !t.unsupportedRangeRequests {
+				fmt.Fprintf(os.Stderr, "Server doesn't support range requests.\n")
+				t.unsupportedRangeRequests = true
+			}
 			skipBytes = t.lastOffset
 		}
 	} else if resp.StatusCode == http.StatusPartialContent {
 		return nil, fmt.Errorf("expected 200, got 206")
 	}
-
-	var totalLength int64
-	if resp.StatusCode == http.StatusPartialContent {
-		contentRange := resp.Header.Get("Content-Range")
-		var err error
-		totalLength, err = getTotalLengthFromContentRange(contentRange)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		totalLength = resp.ContentLength
-	}
-
-	if totalLength < t.totalLength {
-		fmt.Fprintf(os.Stderr, "Total length decreased (old %d, new %d), file was probably truncated. Resetting state.\n", t.totalLength, totalLength)
-		t.lastOffset = 0
-		t.lastLines = 0
-		t.totalLength = 0
-		return nil, nil
-	}
-	t.totalLength = totalLength
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -133,46 +102,49 @@ func (t *Tailer) fetchNewLines() ([]string, error) {
 	nlIndex := bytes.Index(body, nlByte)
 	for nlIndex != -1 { // got whole line
 		lines = append(lines, string(body[0:nlIndex]))
-		t.lastOffset += int64(nlIndex) + 1
-		t.lastLines += 1
-		body = body[nlIndex+1:]
+		t.lastOffset += int64(nlIndex + len(nlByte))
+		body = body[nlIndex+len(nlByte):]
 		nlIndex = bytes.Index(body, nlByte)
 	}
 
 	return lines, nil
 }
 
-func (t *Tailer) loadState() {
-	if *stateFilePath == "" {
-		return
+func (t *Tailer) loadState() error {
+	if t.stateFilePath == "" {
+		t.lastOffset = 0
+		return nil
 	}
-	data, err := os.ReadFile(*stateFilePath)
+	data, err := os.ReadFile(t.stateFilePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return
+			t.lastOffset = 0
+			return nil
 		}
-		fmt.Fprintf(os.Stderr, "Warning: could not read state file: %v\n", err)
-		return
+		return fmt.Errorf("could not read checkpoint file: %v", err)
 	}
-	parts := strings.Split(string(data), "\n")
-	if len(parts) >= 3 {
-		offset, err1 := strconv.ParseInt(parts[0], 10, 64)
-		lines, err2 := strconv.Atoi(parts[1])
-		totalLen, err3 := strconv.ParseInt(parts[2], 10, 64)
-		if err1 == nil && err2 == nil && err3 == nil {
-			t.lastOffset = offset
-			t.lastLines = lines
-			t.totalLength = totalLen
-		}
+
+	var lastOffset int64
+	n, err := fmt.Sscanf(string(data), "%d", &lastOffset)
+	if err != nil {
+		return err
 	}
+	if n < 1 {
+		return fmt.Errorf("invalid checkpoint file")
+	}
+	if lastOffset < 0 {
+		return fmt.Errorf("invalid offset in checkpoint file: %d", lastOffset)
+	}
+	t.lastOffset = lastOffset
+	return nil
 }
 
-func (t *Tailer) saveState() {
-	if *stateFilePath == "" {
-		return
+func (t *Tailer) saveState() error {
+	if t.stateFilePath == "" {
+		return nil
 	}
-	data := fmt.Sprintf("%d\n%d\n%d\n", t.lastOffset, t.lastLines, t.totalLength)
-	_ = os.WriteFile(*stateFilePath, []byte(data), 0644)
+	data := fmt.Sprintf("%d\n", t.lastOffset)
+	return os.WriteFile(t.stateFilePath, []byte(data), 0644)
 }
 
 func main() {
@@ -183,19 +155,22 @@ func main() {
 		os.Exit(1)
 	}
 	url := flag.Arg(0)
-	tailer := NewTailer(url, *requestTimeoutSec)
-	tailer.loadState()
 
-	atexit.Register(func() {
-		fmt.Fprintf(os.Stderr, "Caught signal, saving state and exitting.\n")
-		tailer.saveState()
-	})
+	tailer := NewTailer(url, *requestTimeoutSec, *stateFilePath)
+	err := tailer.loadState()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load state: %v\n", err)
+	}
 
 	for {
 		lines, err := tailer.fetchNewLines()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error fetching file: %v\n", err)
 		} else {
+			err := tailer.saveState()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to save state: %v\n", err)
+			}
 			for _, line := range lines {
 				fmt.Println(line)
 			}
